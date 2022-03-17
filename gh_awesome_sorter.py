@@ -11,19 +11,30 @@ return appropriate 429: Too many request responses.
 The awesome list (index) may have a 1000 or more links to GitHub repositories.
 
 - awesome-selfhosted (939 links)
-- awesome-python (600 links)
+- awesome-python (600 links) => 15 minutes
+- https://github.com/wsvincent/awesome-django
 
 Requirements:
 
 - requests
-- fire
+- 'requests-cache[json]'
+- ujson
 - aiohttp
 - bs4
+- fire
+
+Checklist:
+
+- [x] API-based data fetching
+
+- [ ] Data scraping
+
+- [ ] Storing cached data for faster access (index)
 """
 import asyncio
 from dataclasses import dataclass
-from socket import timeout
-from typing import cast
+from time import sleep
+from typing import Iterable, cast
 
 import requests
 from aiohttp import ClientResponseError, ClientSession, ClientTimeout, TCPConnector
@@ -32,6 +43,8 @@ from bs4.element import Tag
 from fire import Fire
 from regex import findall
 from requests import HTTPError
+from requests_cache import CachedSession
+from tqdm import tqdm
 
 GITHUB_API_BASE_URL = "https://api.github.com/repos/"
 GITHUB_RAW_CONTENT_BASE_URL = "https://raw.githubusercontent.com/"
@@ -75,8 +88,8 @@ class Repo:
 
 
 @dataclass
-class RepoParsed:
-    """Struct for parsed repo."""
+class RepoScraped:
+    """Struct for scraped repo data."""
 
     full_name: str
     stars: int
@@ -154,11 +167,11 @@ def get_repo_fullnames(text: str) -> list[str]:
     Returns:
         list[str]: List of repository full names.
     """
-    github_repo_regex = r"\(https://github\.com/([^\s/]+?/[^\s/]+?)/?\)"
+    github_repo_regex = r"\(https://github\.com/([^\s/]+?/[^\s/#]+)/?#?.*/?\)"
     return findall(github_repo_regex, text)
 
 
-async def get_repo_async(session: ClientSession, full_name: str) -> RepoParsed:
+async def get_repo_async(session: ClientSession, full_name: str) -> RepoScraped:
     repo_html_url = get_repo_html_url(full_name)
 
     try:
@@ -168,12 +181,12 @@ async def get_repo_async(session: ClientSession, full_name: str) -> RepoParsed:
             starsElement = cast(Tag, soup.find(id="repo-stars-counter-star"))
             stars = int(cast(str, starsElement["title"]).replace(",", ""))
 
-            return RepoParsed(full_name=full_name, stars=stars)
+            return RepoScraped(full_name=full_name, stars=stars)
     except asyncio.TimeoutError:
-        return RepoParsed(full_name=full_name, stars=0)
+        return RepoScraped(full_name=full_name, stars=0)
     except ClientResponseError as e:
         if e.status == 404:
-            return RepoParsed(full_name=full_name, stars=0)
+            return RepoScraped(full_name=full_name, stars=0)
 
         if e.status == 429:
             pass
@@ -181,9 +194,9 @@ async def get_repo_async(session: ClientSession, full_name: str) -> RepoParsed:
         raise e
 
 
-async def get_repos_async(full_names: list[str]) -> tuple[RepoParsed]:
+async def get_repos_async(full_names: list[str]) -> tuple[RepoScraped]:
     """Fetch repository details based on fullnames (async coroutine)."""
-    conn = TCPConnector(limit=10, ttl_dns_cache=300)
+    conn = TCPConnector(limit=None, ttl_dns_cache=300)
     async with ClientSession(
         connector=conn,
         raise_for_status=True,
@@ -195,9 +208,48 @@ async def get_repos_async(full_names: list[str]) -> tuple[RepoParsed]:
         )
 
 
-async def get_sorted_awesome_list_repos(
-    repo: str, process_count: int
-) -> list[RepoParsed]:
+# Synchronous scrape-based repo data fetching
+#
+
+
+def get_repo_scraped(session: CachedSession, full_name: str) -> RepoScraped:
+    repo_html_url = get_repo_html_url(full_name)
+
+    try:
+        response = session.get(repo_html_url)
+        response.raise_for_status()
+    except HTTPError as e:
+        if e.response.status_code == 429:
+            # If too many requests wait 60 seconds and retry request
+            sleep(60)
+            return get_repo_scraped(session, full_name)
+
+        raise e
+
+    repo_html = response.text
+    soup = BeautifulSoup(repo_html, "html.parser")
+    starsElement = cast(Tag, soup.find(id="repo-stars-counter-star"))
+    stars = int(cast(str, starsElement["title"]).replace(",", ""))
+
+    return RepoScraped(full_name=full_name, stars=stars)
+
+
+def get_repos_scraped(full_names: list[str]) -> Iterable[RepoScraped]:
+    session = CachedSession(
+        "github_repos_cache", backend="filesystem", serializer="pickle"
+    )
+
+    for full_name in tqdm(full_names):
+        try:
+            yield get_repo_scraped(session, full_name)
+        except HTTPError as e:
+            if e.response.status_code == 404:
+                continue
+
+            raise e
+
+
+def get_sorted_awesome_list_repos(repo: str, process_count: int) -> list[RepoScraped]:
     # Get repo fullname
     if repo.startswith("https://github.com/"):
         repo_fullname = repo.removeprefix("https://github.com/")
@@ -213,17 +265,20 @@ async def get_sorted_awesome_list_repos(
     # Parse to get all repo fullnames (by github links)
     repo_fullnames = get_repo_fullnames(readme_text)
 
+    # Remove duplicate full names
+    repo_fullnames = list(set(repo_fullnames))
+
     print("Fetching started...")
     if process_count is None:
-        repos = await get_repos_async(repo_fullnames)
+        repos = get_repos_scraped(repo_fullnames)
     else:
-        repos = await get_repos_async(repo_fullnames[:process_count])
+        repos = get_repos_scraped(repo_fullnames[:process_count])
 
     # Sort repos by stars
     return sorted(repos, key=lambda r: r.stars, reverse=True)
 
 
-async def main(repo: str, count: int = 10, process_count: int = 10):
+def main(repo: str, count: int = 10, process_count: int = None):
     """Main sorter interface entry point.
 
     Args:
@@ -236,7 +291,7 @@ async def main(repo: str, count: int = 10, process_count: int = 10):
 
     try:
         # Get sorted repos
-        repos = await get_sorted_awesome_list_repos(repo, process_count)
+        repos = get_sorted_awesome_list_repos(repo, process_count)
         # Print enumerated repos to the console
         for i, sorted_repo in enumerate(repos[:count]):
             print(
